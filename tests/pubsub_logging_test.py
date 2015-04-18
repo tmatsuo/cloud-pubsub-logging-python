@@ -24,6 +24,8 @@ from apiclient import errors
 
 import mock
 
+from mock import patch
+
 import pubsub_logging
 
 from pubsub_logging.errors import RecoverableError
@@ -134,11 +136,13 @@ class AsyncPubsubHandlerTest(unittest.TestCase):
         self.mocked_client = mock.MagicMock()
         self.topic = 'projects/test-project/topics/test-topic'
 
-    def test_single_message(self):
+    @patch('pubsub_logging.async_handler.get_pubsub_client')
+    def test_single_message(self, get_pubsub_client):
         """Tests if utils.publish_body is called with one message."""
+        get_pubsub_client.return_value = self.mocked_client
         self.counter = CountPublishBody()
         self.handler = pubsub_logging.AsyncPubsubHandler(
-            topic=self.topic, client=self.mocked_client, retry=self.RETRY,
+            topic=self.topic, client=None, retry=self.RETRY,
             worker_num=1, publish_body=self.counter)
         log_msg = 'Test message'
         r = logging.LogRecord('test', logging.CRITICAL, None, 0, log_msg, [],
@@ -147,9 +151,10 @@ class AsyncPubsubHandlerTest(unittest.TestCase):
         self.handler.close()
         with self.counter.lock:
             self.assertEqual(1, self.counter.cnt.value)
+        get_pubsub_client.assert_called_once_with()
 
     def test_handler_ignores_error(self):
-        """Tests if the handler ignores errors and throws the logs away."""
+        """Tests if the handler ignores errors."""
         mock_publish_body = mock.MagicMock()
         mock_publish_body.side_effect = [RecoverableError(), mock.DEFAULT]
         self.counter = CountPublishBody(mock=mock_publish_body)
@@ -175,7 +180,7 @@ class AsyncPubsubHandlerTest(unittest.TestCase):
         self.counter = CountPublishBody()
         self.handler = pubsub_logging.AsyncPubsubHandler(
             topic=self.topic, client=self.mocked_client, retry=self.RETRY,
-            worker_num=10, publish_body=self.counter)
+            worker_num=1, publish_body=self.counter)
         log_msg = 'Test message'
         r = logging.LogRecord('test', logging.CRITICAL, None, 0, log_msg, [],
                               None)

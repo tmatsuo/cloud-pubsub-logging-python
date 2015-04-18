@@ -30,12 +30,13 @@ import multiprocessing as mp
 # For Python 2 and Python 3 compatibility.
 try:
     from queue import Empty
-except ImportError:
+except ImportError:  # pragma: NO COVER
     from Queue import Empty
 
 from pubsub_logging import errors
 
 from pubsub_logging.utils import compat_urlsafe_b64encode
+from pubsub_logging.utils import get_or_create_topic
 from pubsub_logging.utils import get_pubsub_client
 from pubsub_logging.utils import publish_body
 
@@ -45,41 +46,44 @@ DEFAULT_POOL_SIZE = 1
 DEFAULT_RETRY_COUNT = 10
 
 
-def send_loop(client, q, topic, retry, logger, format_func,
-              publish_body):  # pragma: NO COVER
-    """Process loop for indefinitely sending logs to Cloud Pub/Sub.
+class PubsubWorker(object):
+    """A worker for publishing logs in child processes."""
+    def __init__(self, client):
+        self.should_exit = mp.Value('i', 0)
+        self._client = client
 
-    Args:
-      client: Pub/Sub client. If it's None, a new client will be created.
-      q: mp.JoinableQueue instance to get the message from.
-      topic: Cloud Pub/Sub topic name to send the logs.
-      retry: How many times to retry upon Cloud Pub/Sub API failure.
-      logger: A logger for informing failures within this function.
-      format_func: A callable for formatting the logs.
-      publish_body: A callable for sending the logs.
-    """
-    if client is None:
-        client = get_pubsub_client()
-    while True:
-        try:
-            logs = q.get()
-        except Empty:
-            continue
-        try:
-            body = {'messages':
-                    [{'data': compat_urlsafe_b64encode(format_func(r))}
-                        for r in logs]}
-            publish_body(client, body, topic, retry)
-        except errors.RecoverableError as e:
-            # Records the exception and puts the logs back to the deque
-            # and prints the exception to stderr.
-            q.put(logs)
-            logger.exception(e)
-        except Exception as e:
-            logger.exception(e)
-            logger.warn('There was a non recoverable error, exiting.')
-            return
-        q.task_done()
+    def send_loop(self, q, topic, retry, logger, fmt, publish_body):
+        """Process loop for indefinitely sending logs to Cloud Pub/Sub.
+        Args:
+          q: mp.JoinableQueue instance to get the message from.
+          topic: Cloud Pub/Sub topic name to send the logs.
+          retry: How many times to retry upon Cloud Pub/Sub API failure.
+          logger: A logger for informing failures within this function.
+          fmt: A callable for formatting the logs.
+          publish_body: A callable for sending the logs.
+        """
+        if not self._client:  # pragma: NO COVER
+            self._client = get_pubsub_client()
+        while not self.should_exit.value:
+            try:
+                logs = q.get(block=True, timeout=1)
+            except Empty:
+                continue
+            try:
+                body = {'messages':
+                        [{'data': compat_urlsafe_b64encode(fmt(r))}
+                            for r in logs]}
+                publish_body(self._client, body, topic, retry)
+            except errors.RecoverableError as e:
+                # Records the exception and puts the logs back to the deque
+                # and prints the exception to stderr.
+                q.put(logs)
+                logger.exception(e)
+            except Exception as e:  # pragma: NO COVER
+                logger.exception(e)
+                logger.warn('There was a non recoverable error, exiting.')
+                return
+            q.task_done()
 
 
 class AsyncPubsubHandler(logging.Handler):
@@ -106,14 +110,22 @@ class AsyncPubsubHandler(logging.Handler):
         self._q = mp.JoinableQueue()
         self._batch_size = BATCH_SIZE
         self._buf = []
+        self._workers = []
+        if client:
+            _client = client
+        else:
+            _client = get_pubsub_client()
+        self._worker = PubsubWorker(client)
+        get_or_create_topic(_client, topic, retry)
         if not stderr_logger:
             stderr_logger = logging.Logger('last_resort')
             stderr_logger.addHandler(logging.StreamHandler())
         for _ in range(worker_num):
-            p = mp.Process(target=send_loop,
-                           args=(client, self._q, topic, retry, stderr_logger,
+            p = mp.Process(target=self._worker.send_loop,
+                           args=(self._q, topic, retry, stderr_logger,
                                  self.format, publish_body))
             p.daemon = True
+            self._workers.append(p)
             p.start()
 
     def emit(self, record):
@@ -135,4 +147,7 @@ class AsyncPubsubHandler(logging.Handler):
         """Joins the child processes and call the superclass's close."""
         with self.lock:
             self.flush()
+            self._worker.should_exit.value = 1
+            for p in self._workers:
+                p.join()
         super(AsyncPubsubHandler, self).close()

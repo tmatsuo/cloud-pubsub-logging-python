@@ -1,3 +1,5 @@
 [report]
 exclude_lines =
     pragma: NO COVER
+include =
+    pubsub_logging*
